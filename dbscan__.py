@@ -1,233 +1,25 @@
 # -*- coding: utf-8 -*-
 
 
-import numpy as np
+import logging
+import multiprocessing
 import warnings
+from collections import Counter, deque
+
+import numpy as np
 from scipy import sparse
-from collections import deque,Counter
-
 from sklearn.base import BaseEstimator, ClusterMixin
-from sklearn.utils import check_array
 from sklearn.neighbors import NearestNeighbors
+from sklearn.utils import check_array
+from tqdm import tqdm
 
+from multiprocess_df import Consumer, TaskTracker
 
-
-def dbscan(X, eps=0.5, min_samples=5, metric='minkowski', metric_params=None,
-           algorithm='auto', leaf_size=30, p=2, sample_weight=None,
-           n_jobs=None):
-    """Perform DBSCAN clustering from vector array or distance matrix.
-
-    Read more in the :ref:`User Guide <dbscan>`.
-
-    Parameters
-    ----------
-    X : array or sparse (CSR) matrix of shape (n_samples, n_features), or \
-            array of shape (n_samples, n_samples)
-        A feature array, or array of distances between samples if
-        ``metric='precomputed'``.
-
-    eps : float, optional
-        The maximum distance between two samples for one to be considered
-        as in the neighborhood of the other. This is not a maximum bound
-        on the distances of points within a cluster. This is the most
-        important DBSCAN parameter to choose appropriately for your data set
-        and distance function.
-
-    min_samples : int, optional
-        The number of samples (or total weight) in a neighborhood for a point
-        to be considered as a core point. This includes the point itself.
-
-    metric : string, or callable
-        The metric to use when calculating distance between instances in a
-        feature array. If metric is a string or callable, it must be one of
-        the options allowed by :func:`sklearn.metrics.pairwise_distances` for
-        its metric parameter.
-        If metric is "precomputed", X is assumed to be a distance matrix and
-        must be square during fit.
-        X may be a :term:`sparse graph <sparse graph>`,
-        in which case only "nonzero" elements may be considered neighbors.
-
-    metric_params : dict, optional
-        Additional keyword arguments for the metric function.
-
-        .. versionadded:: 0.19
-
-    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, optional
-        The algorithm to be used by the NearestNeighbors module
-        to compute pointwise distances and find nearest neighbors.
-        See NearestNeighbors module documentation for details.
-
-    leaf_size : int, optional (default = 30)
-        Leaf size passed to BallTree or cKDTree. This can affect the speed
-        of the construction and query, as well as the memory required
-        to store the tree. The optimal value depends
-        on the nature of the problem.
-
-    p : float, optional
-        The power of the Minkowski metric to be used to calculate distance
-        between points.
-
-    sample_weight : array, shape (n_samples,), optional
-        Weight of each sample, such that a sample with a weight of at least
-        ``min_samples`` is by itself a core sample; a sample with negative
-        weight may inhibit its eps-neighbor from being core.
-        Note that weights are absolute, and default to 1.
-
-    n_jobs : int or None, optional (default=None)
-        The number of parallel jobs to run for neighbors search.
-        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
-        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
-        for more details.
-
-    Returns
-    -------
-    core_samples : array [n_core_samples]
-        Indices of core samples.
-
-    labels : array [n_samples]
-        Cluster labels for each point.  Noisy samples are given the label -1.
-
-    See also
-    --------
-    DBSCAN
-        An estimator interface for this clustering algorithm.
-    OPTICS
-        A similar estimator interface clustering at multiple values of eps. Our
-        implementation is optimized for memory usage.
-
-    Notes
-    -----
-    For an example, see :ref:`examples/cluster/plot_dbscan.py
-    <sphx_glr_auto_examples_cluster_plot_dbscan.py>`.
-
-    This implementation bulk-computes all neighborhood queries, which increases
-    the memory complexity to O(n.d) where d is the average number of neighbors,
-    while original DBSCAN had memory complexity O(n). It may attract a higher
-    memory complexity when querying these nearest neighborhoods, depending
-    on the ``algorithm``.
-
-    One way to avoid the query complexity is to pre-compute sparse
-    neighborhoods in chunks using
-    :func:`NearestNeighbors.radius_neighbors_graph
-    <sklearn.neighbors.NearestNeighbors.radius_neighbors_graph>` with
-    ``mode='distance'``, then using ``metric='precomputed'`` here.
-
-    Another way to reduce memory and computation time is to remove
-    (near-)duplicate points and use ``sample_weight`` instead.
-
-    :func:`cluster.optics <sklearn.cluster.optics>` provides a similar
-    clustering with lower memory usage.
-
-    References
-    ----------
-    Ester, M., H. P. Kriegel, J. Sander, and X. Xu, "A Density-Based
-    Algorithm for Discovering Clusters in Large Spatial Databases with Noise".
-    In: Proceedings of the 2nd International Conference on Knowledge Discovery
-    and Data Mining, Portland, OR, AAAI Press, pp. 226-231. 1996
-
-    Schubert, E., Sander, J., Ester, M., Kriegel, H. P., & Xu, X. (2017).
-    DBSCAN revisited, revisited: why and how you should (still) use DBSCAN.
-    ACM Transactions on Database Systems (TODS), 42(3), 19.
-    """
-
-    est = DBSCAN(eps=eps, min_samples=min_samples, metric=metric,
-                 metric_params=metric_params, algorithm=algorithm,
-                 leaf_size=leaf_size, p=p, n_jobs=n_jobs)
-    est.fit(X, sample_weight=sample_weight)
-    return est.core_sample_indices_, est.labels_
-
-
-
-
-
-def dbscan_inner(is_core, neighborhoods, labels):
-    i, label_num = 0, 0
-    neighb = []
-    stack = deque()
-
-    for i in range(labels.shape[0]):
-        if labels[i] != -1 or not is_core[i]:
-            continue
-
-        # Depth-first search starting from i, ending at the non-core points.
-        # This is very similar to the classic algorithm for computing connected
-        # components, the difference being that we label non-core points as
-        # part of a cluster (component), but don't expand their neighborhoods.
-        while True:
-            if labels[i] == -1:
-                labels[i] = label_num
-                if is_core[i]:
-                    neighb = neighborhoods[i]
-                    for v in neighb:
-                        if labels[v] == -1:
-                            stack.append(v)
-
-            if len(stack) == 0:
-                break
-            i = stack.popleft()
-
-        label_num += 1
+logger = logging.getLogger(__name__)
 
 
 class DBSCAN(ClusterMixin, BaseEstimator):
-    """Perform DBSCAN clustering from vector array or distance matrix.
-
-    DBSCAN - Density-Based Spatial Clustering of Applications with Noise.
-    Finds core samples of high density and expands clusters from them.
-    Good for data which contains clusters of similar density.
-
-    Read more in the :ref:`User Guide <dbscan>`.
-
-    Parameters
-    ----------
-    eps : float, default=0.5
-        The maximum distance between two samples for one to be considered
-        as in the neighborhood of the other. This is not a maximum bound
-        on the distances of points within a cluster. This is the most
-        important DBSCAN parameter to choose appropriately for your data set
-        and distance function.
-
-    min_samples : int, default=5
-        The number of samples (or total weight) in a neighborhood for a point
-        to be considered as a core point. This includes the point itself.
-
-    metric : string, or callable, default='euclidean'
-        The metric to use when calculating distance between instances in a
-        feature array. If metric is a string or callable, it must be one of
-        the options allowed by :func:`sklearn.metrics.pairwise_distances` for
-        its metric parameter.
-        If metric is "precomputed", X is assumed to be a distance matrix and
-        must be square. X may be a :term:`Glossary <sparse graph>`, in which
-        case only "nonzero" elements may be considered neighbors for DBSCAN.
-
-        .. versionadded:: 0.17
-           metric *precomputed* to accept precomputed sparse matrix.
-
-    metric_params : dict, default=None
-        Additional keyword arguments for the metric function.
-
-        .. versionadded:: 0.19
-
-    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, default='auto'
-        The algorithm to be used by the NearestNeighbors module
-        to compute pointwise distances and find nearest neighbors.
-        See NearestNeighbors module documentation for details.
-
-    leaf_size : int, default=30
-        Leaf size passed to BallTree or cKDTree. This can affect the speed
-        of the construction and query, as well as the memory required
-        to store the tree. The optimal value depends
-        on the nature of the problem.
-
-    p : float, default=None
-        The power of the Minkowski metric to be used to calculate distance
-        between points.
-
-    n_jobs : int or None, default=None
-        The number of parallel jobs to run.
-        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
-        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
-        for more details.
+    """
 
     Attributes
     ----------
@@ -252,54 +44,17 @@ class DBSCAN(ClusterMixin, BaseEstimator):
     array([ 0,  0,  0,  1,  1, -1])
     >>> clustering
     DBSCAN(eps=3, min_samples=2)
-
-    See also
-    --------
-    OPTICS
-        A similar clustering at multiple values of eps. Our implementation
-        is optimized for memory usage.
-
-    Notes
-    -----
-    For an example, see :ref:`examples/cluster/plot_dbscan.py
-    <sphx_glr_auto_examples_cluster_plot_dbscan.py>`.
-
-    This implementation bulk-computes all neighborhood queries, which increases
-    the memory complexity to O(n.d) where d is the average number of neighbors,
-    while original DBSCAN had memory complexity O(n). It may attract a higher
-    memory complexity when querying these nearest neighborhoods, depending
-    on the ``algorithm``.
-
-    One way to avoid the query complexity is to pre-compute sparse
-    neighborhoods in chunks using
-    :func:`NearestNeighbors.radius_neighbors_graph
-    <sklearn.neighbors.NearestNeighbors.radius_neighbors_graph>` with
-    ``mode='distance'``, then using ``metric='precomputed'`` here.
-
-    Another way to reduce memory and computation time is to remove
-    (near-)duplicate points and use ``sample_weight`` instead.
-
-    :class:`cluster.OPTICS` provides a similar clustering with lower memory
-    usage.
-
-    References
-    ----------
-    Ester, M., H. P. Kriegel, J. Sander, and X. Xu, "A Density-Based
-    Algorithm for Discovering Clusters in Large Spatial Databases with Noise".
-    In: Proceedings of the 2nd International Conference on Knowledge Discovery
-    and Data Mining, Portland, OR, AAAI Press, pp. 226-231. 1996
-
-    Schubert, E., Sander, J., Ester, M., Kriegel, H. P., & Xu, X. (2017).
-    DBSCAN revisited, revisited: why and how you should (still) use DBSCAN.
-    ACM Transactions on Database Systems (TODS), 42(3), 19.
     """
 
-    def __init__(self, eps=0.5, min_samples=5, metric='euclidean',
-                 metric_params=None, algorithm='auto', leaf_size=30, p=None,
+    def __init__(self, eps=0.5, min_samples=15 ,min_dense=6 , metric='euclidean',
+                 metric_params=None, algorithm='auto', leaf_size=30, p=None,max_iter = 1e6,
                  n_jobs=None):
+        # print("eps, min_samples ,min_dense:  ",eps, min_samples ,min_dense)
         self.eps = eps
         self.min_samples = min_samples
+        self.min_dense = min_dense
         self.metric = metric
+        self.max_iter = int(max_iter)
         self.metric_params = metric_params
         self.algorithm = algorithm
         self.leaf_size = leaf_size
@@ -332,6 +87,7 @@ class DBSCAN(ClusterMixin, BaseEstimator):
 
         """
         X = check_array(X, accept_sparse='csr')
+        self.X = X
 
         if not self.eps > 0.0:
             raise ValueError("eps must be positive.")
@@ -371,10 +127,24 @@ class DBSCAN(ClusterMixin, BaseEstimator):
         # A list of all core samples found.
         # core_samples = np.asarray(n_neighbors >= self.min_samples,
         #                           dtype=np.uint8)
-        core_samples,neighborhoods = self.check_core(n_neighbors, neighborhoods, 3*self.min_samples)
-        dbscan_inner(core_samples, neighborhoods, labels)
+        core_samples, neighborhoods_core = self.check_core(n_neighbors,
+                    neighborhoods, self.min_dense)
+        self.dbscan_first(core_samples, neighborhoods_core, labels)
 
+        logger.debug('dbscan_after')
+        labels_ = tuple(np.full(X.shape[0], -1, dtype=np.intp))
+        for i in range(self.max_iter):
+            labels_ = labels.copy()
+            labels = self.dbscan_after(core_samples, neighborhoods, labels)
+            if False not in (labels_== labels):
+                break
+
+        logger.debug('{} iter dbscan_after'.format(str(i)))
         self.core_sample_indices_ = np.where(core_samples)[0]
+
+        labels_counter = Counter(labels)
+        cluster_labels = [ c_n[0] for c_n in  labels_counter.items() if c_n[1] > self.min_samples]
+        labels = [ l if l in cluster_labels else -1 for l in labels ]
         self.labels_ = labels
 
         if len(self.core_sample_indices_):
@@ -415,20 +185,190 @@ class DBSCAN(ClusterMixin, BaseEstimator):
         return self.labels_
 
     def check_core(self,n_neighbors,neighbors,basic_dense):
+        logger.debug("calc_neighbors_list")
         core = set()
+
         neighbors_ = tuple([] for i in n_neighbors)
         core_samples_index = np.where(n_neighbors >= basic_dense)[0]
-        for ind in core_samples_index:
+        if len(core_samples_index)< 100000:
+            for ind in core_samples_index:
 
-            neighbors_counter = Counter(neighbors[ind])
-            
-            for ind_ in neighbors[ind]:
-                neighbors_counter.update(neighbors[ind_])
-            neighbor = [ind for ind,num in neighbors_counter.items() if num >= basic_dense]
-            neighbors_[ind].extend(neighbor)
-            core.update(neighbor)
+                ind, neighbor = self.single_func(ind, neighbors=neighbors,basic_dense=basic_dense)
+                neighbors_[ind].extend(neighbor)
+                core.update(neighbor)
+        else:
+            logger.debug("begin multiprocess")
+            args = {
+                "neighbors": neighbors,
+                "basic_dense": basic_dense
+            }
+            results_list = self.multiprocess_func(self.single_func, core_samples_index, **args)
+            logger.debug("multiprocess finish")
+            for results in results_list:
+                ind, neighbor = results
+                neighbors_[ind].extend(neighbor)
+                core.update(neighbor)
+
         core_array = np.zeros(len(n_neighbors))
         for i in core:
             core_array[i] = 1
-        return core_array,neighbors_
-        
+        logger.debug("get_neighbors_list")
+        return core_array, neighbors_
+
+    def single_func(self, ind,  neighbors=None, basic_dense=None):
+        neighbors_counter = Counter(neighbors[ind])
+
+        for ind_ in neighbors[ind]:
+            neighbors_counter.update(neighbors[ind_])
+        neighbor = tuple(ind_ for ind_, num in neighbors_counter.items() if num >= basic_dense)
+        neighbors_set = set(neighbors[ind]).intersection(set(neighbor))
+
+        coor = np.array([self.X[i] for i in neighbors_set])
+        x_coor = coor[:,0]
+        y_coor = coor[:,1]
+
+        dx = max(x_coor)-min(x_coor)
+        dy = max(y_coor)-min(y_coor)
+
+        if dx>1000 or dy>1000:
+            print(x)
+            # from matplotlib import pyplot as plt
+            # plt.plot(x_coor, y_coor, 'o',markersize=2)
+            # plt.show()
+
+
+
+        return ind, neighbors_set
+
+    def multiprocess_func(self, single_func, listdata, **kwarg):
+
+        num_process = self.n_jobs
+        # Establish communication queues
+        tasks = multiprocessing.JoinableQueue()
+        results = multiprocessing.Queue()
+        error_queue = multiprocessing.Queue()
+        # Enqueue tasks
+        num_task = len(listdata)
+        for i in range(num_task):
+            tasks.put(listdata[i])
+
+        logger.debug('Create {} processes'.format(num_process))
+        consumers = [Consumer(single_func, tasks, results, error_queue, **kwarg)
+                    for i in range(num_process)]
+        for w in consumers:
+            w.start()
+        # Add a task tracking process
+        task_tracker = TaskTracker(tasks, False)
+        task_tracker.start()
+        # Wait for all input data to be processed
+        tasks.join()
+        for w in consumers:
+            w.terminate()
+        # If there is any error in any process, output the error messages
+        num_error = error_queue.qsize()
+        if num_error > 0:
+            for i in range(num_error):
+                logger.error(error_queue.get())
+            raise RuntimeError('Multi process jobs failed')
+        else:
+            # Collect results
+            result_table_file = open("result_table","w")
+            logger.debug('Collect results')
+            result_table = deque()
+            for i in range(num_task):
+                res = results.get()
+                result_table.append(res)
+            logger.debug('Collect results done')
+            return result_table
+
+    def dbscan_first(self, is_core, neighborhoods, labels,):
+        """
+        get cluster init
+        """
+        logger.debug("dbscan_first")
+        i, label_num = 0, 0
+        neighb = []
+        stack = deque()
+
+        for i in range(labels.shape[0]):
+            if labels[i] != -1 or not is_core[i]:
+                continue
+
+            # Width-first search starting from i, ending at the non-core points.
+            # This is very similar to the classic algorithm for computing connected
+            # components, the difference being that we label non-core points as
+            # part of a cluster (component), but don't expand their neighborhoods.
+            while True:
+                if labels[i] == -1:
+                    labels[i] = label_num
+                    if is_core[i]:
+                        neighb = neighborhoods[i]
+                        for v in neighb:
+                            if labels[v] == -1:
+                                stack.append(v)
+
+                if len(stack) == 0:
+                    break
+                i = stack.popleft()
+
+            label_num += 1
+        #     print("label_num",label_num,end="")
+        #     print("\r")
+        # print("\n")
+        return labels
+
+    def dbscan_after(self, is_core, neighborhoods, labels,):
+        i, label_num = 0, 0
+        neighb = []
+        stack = deque()
+        arrived = np.full(labels.shape[0], False, dtype=bool)
+        arrived_num = 0
+
+        for i in range(labels.shape[0]):
+            if arrived[i]:
+                 continue
+            arrived[i] = True
+            # Width-first search starting from i, ending at the non-core points.
+            # This is very similar to the classic algorithm for computing connected
+            # components, the difference being that we label non-core points as
+            # part of a cluster (component), but don't expand their neighborhoods.
+            # print("starte while")
+            while_loop = 0
+            while True:
+                while_loop += 1
+                # if while_loop%10000 == 0:
+                #     print("while_loop:\t",while_loop)
+                #     print("len(stack):\t",len(stack))
+                #     print("arrived_sum:\t",sum(arrived))
+                #     print("arrived_num:\t",arrived_num)
+                #     print(label_num)
+
+                # if arrived_num%100 == 0:
+                #     print("len(stack):\t",len(stack))
+                #     print("arrived_sum:\t",sum(arrived))
+                #     print("arrived_num:\t",arrived_num)
+                #     print(label_num)
+                neighb = neighborhoods[i]
+
+                arrived_num += 1
+                if labels[i] == -1 :
+                    neighb_labels = tuple(labels[v] for v in neighb if labels[v] != -1)
+                    if len(neighb_labels) > self.min_dense:
+                        labels_counter = Counter(neighb_labels)
+                        label_num, counter = labels_counter.most_common(1)[0]
+                        if counter > self.min_dense:
+                            labels[i] = label_num
+
+                for v in neighb:
+                    if not arrived[v]:
+                        arrived[v] = True
+                        stack.append(v)
+
+                if len(stack) == 0:
+                    break
+                i = stack.popleft()
+        #     print("finish while")
+        # print("tt arrived_sum:\t",sum(arrived))
+        # print("tt arrived_num:\t",arrived_num)
+        # print(label_num)
+        return labels
